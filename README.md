@@ -7,11 +7,20 @@ merged per domain.
 
 It is built for the operational cases in the brief:
 
+* shards are read **in parallel** through one process-local, configurable read
+  concurrency pool (`SOURCE_READ_CONCURRENCY`, set in `docker-compose.yml`);
+  initial scans, rescans and repair/backfill reads share the same slots;
+* freed slots are offered first to a **job that has shards queued and no shard
+  currently reading** (two contending jobs take turns fairly); leftover slots
+  let one job read several shards at once;
+* each shard's progress is persisted the moment its read finishes, and a
+  failed read releases its slot; each run report lists every source read's
+  **start/end timestamps and duration**;
 * a temporary part file goes missing or gets truncated between partition and merge;
 * repair re-reads **only** the source shards that own damaged parts and reports
   the re-read shard numbers;
 * every source is counted **once** — repair replaces a shard's contribution, it
-  never adds a second one;
+  never adds a second one, and a shard is attempted at most once per run;
 * if the source shard is itself unreadable, its partitions are **withheld** (no
   half result is published), the run can be retried after recovery, and
   partitions whose sources are all healthy remain queryable throughout.
@@ -23,8 +32,13 @@ It is built for the operational cases in the brief:
 ```bash
 python3 scripts/make_samples.py          # regenerate samples/data if needed
 docker compose up --build -d
-docker compose logs -f aggregator        # wait for "engine ready …"
+docker compose logs -f aggregator        # wait for "engine ready … source_read_concurrency=2"
 ```
+
+The per-process source-read cap defaults to `2` and is configured in
+`docker-compose.yml` (`SOURCE_READ_CONCURRENCY`, overridable from the host,
+e.g. `SOURCE_READ_CONCURRENCY=4 docker compose up`). `/health` shows the live
+scheduler state.
 
 Open **http://localhost:8000/docs** and use *Try it out*:
 
@@ -115,16 +129,20 @@ pytest -q
 * `rescan_shards` forces a fresh read of listed shards (e.g. after log
   rotation); their parts are replaced, never appended.
 
-Run report fields relevant to the brief:
-
 | field | meaning |
 |---|---|
+| `source_reads` | every source-read attempt in this run, with `kind` (`scan`/`retry_scan`/`rescan`/`repair`), `success`, `started_at`, `finished_at`, `duration_ms`, and `error_type`/`error` on failure |
 | `reread_shards` | sources re-read in this run (repairs, retry scans, rescans) |
 | `reread_shard_numbers` | their 1-based positions in the job's fixed shard list |
 | `repaired_shards` / `failed_repairs` | repair outcome per source |
 | `source_read_counts` | successful full reads per source **in this run** (max 1) |
 | `faults` | applied / no-op / failed simulations |
 | `warnings`, `errors` | malformed-line samples, withheld partitions, failures |
+
+`GET /health` additionally reports `source_read_concurrency` and a
+`read_scheduler` snapshot (`active_reads`, `active_reads_by_job`,
+`queued_shards_by_job`, `idle_jobs_with_queue`) that is useful while watching
+two jobs contend.
 
 `GET /jobs/{id}/results` also exposes cumulative `reread_shards` /
 `reread_shard_numbers` and `unscanned_shards`.
@@ -165,6 +183,36 @@ merge: for each domain, sum at most one contribution per shard in fixed order
 job.json (atomic) ──► GET /results
 ```
 
+### Parallel reads and fair slots
+
+`app/scheduler.py` owns one process-local `ReadScheduler` per Engine (one
+Engine in the single uvicorn process). It runs exactly
+`SOURCE_READ_CONCURRENCY` daemon reader workers (default `2`; Compose sets it
+explicitly and it can be overridden from the host shell). Every disk read —
+initial scan, forced rescan, retry scan, repair/backfill — is a `ReadRequest`
+through this one pool, so all kinds and all jobs share the cap.
+
+Whenever a read slot frees, the next shard is picked under one condition lock:
+
+1. **idle jobs first** — a job that has shards queued and zero reads in flight
+   wins; among several, the job waiting longest (a monotonic fairness token
+   assigned when it becomes idle-with-queue) is served first;
+2. **then same-job parallelism** — if no job is idle-with-queue, spare slots
+   go to the job with the fewest in-flight reads, then the oldest request, so
+   one job reads several shards at once.
+
+The slot bounds the actual source read and is released in a `finally` as soon
+as the read returns or raises; per-shard progress is then persisted under a
+per-job state lock (several reader threads can finish together). Each shard
+save is the same temp-file + fsync + `os.replace` write as before. A batch
+barrier waits for every shard callback, so after the scan phase all
+initial-scan/rescan progress is durably on disk before part faults are
+applied and verify → repair → merge begins. `run_batch` waits for sibling
+shards even when one callback fails, then re-raises the first error.
+
+The image starts uvicorn with `--workers 1` deliberately: the fairness pool is
+process-local. Running more workers/replicas multiplies the effective cap.
+
 ### Why no double counting
 
 * A partition is always **recomputed** from the manifest as
@@ -172,9 +220,11 @@ job.json (atomic) ──► GET /results
   in place. Repair overwrites the shard's parts and manifest entry.
 * Counters live in `parts/`, keyed by shard and domain, one file per pair. A
   re-read deletes parts for domains that vanished.
-* Each `POST /run` reads a given source at most once: the correlation between
-  scan phase and repair phase is tracked (`attempted` set), so a rescan followed
-  by a fault never produces a second read.
+* Each `POST /run` **attempts** a given source at most once, even with parallel
+  readers: the scan plan contains each eligible shard once, and the repair
+  phase skips any shard already present in `run.source_reads` (the
+  `attempted` set), so a rescan followed by a fault never produces a second
+  read in the same round.
 * `job.json` and every part file are written temp-file + fsync + `os.replace`,
   so a crash leaves either the old or the new file, never a torn one.
 
@@ -221,21 +271,58 @@ and resolved paths must stay inside it (symlink escapes are rejected).
 
 ## 6. Verification performed
 
-* `pytest -q` → **75 passed** (unit + API + crash/retry tests).
-* Live `uvicorn` run on the sample shards (`scripts/demo.sh`):
-  * baseline: `api.example.com 48/3`, `cdn.shop.example.org 47/2`,
-    `ledger.example.io 29/1`, `media.example.dev 9/1`, `shop.example.org 47/3`,
-    `static.example.net 47/3`, `www.example.com 48/2` (total/5xx);
-  * truncated part → `reread_shards: ["gw-02.log"]`, numbers `[2]`, totals
-    unchanged after repair;
-  * deleted part + unavailable source → `status: partial`, five domains blocked
-    with `gw-02.log`, two unaffected domains still published;
-  * repeated retry while unavailable → still withheld, no extra reads;
-  * restore + retry → `completed`, identical to baseline;
-  * extra runs → no reads, no change (idempotent).
+* `pytest -q` → **87 passed** (the original 75 unit/API/crash/retry tests plus
+  12 new tests in `tests/test_concurrency.py` for the fair scheduler, parallel
+  scans, per-shard persistence, two-job contention, failure slot release, the
+  corruption→rescan/repair flow and the Compose wiring). The concurrency tests
+  were re-run repeatedly to rule out timing flakes.
+* Two-job contention, automated (`tests/test_concurrency.py`):
+  * scheduler white-box test proves the pick order is idle-job (longest
+    waiting token) → other idle job → same-job spare slot, and that a freshly
+    idle job ranks behind an already-waiting job;
+  * deterministic gate test with cap 2: two shards of job A fill the slots,
+    job B queues, and when one A slot frees **B's first read starts before
+    A's third shard**; global active reads never exceed 2;
+  * real `Engine` two-job run (6 shards each, cap 2): observed max in-read
+    concurrency 2, real cross-job overlap, every shard read exactly once,
+    correct totals, all slots released;
+  * a gated blocked shard proves another shard's `done` progress is already
+    durably in `job.json` while the blocked shard is still reading;
+  * a failing read releases the slot and the same scheduler worker immediately
+    serves the next batch.
+* Live HTTP self-test with `uvicorn` started with the Compose-equivalent
+  environment (`SOURCE_READ_CONCURRENCY=2`, `ALLOW_SIMULATION=true`):
+  * `GET /docs` → 200 and `/openapi.json` exposes `started_at` / `finished_at`
+    / `duration_ms` on `SourceRead`; `GET /health` reports the cap and
+    scheduler snapshot;
+  * two jobs launched simultaneously over HTTP (4–6 sizeable shards each):
+    report intervals show max overlap depth exactly 2 and cross-job overlap;
+    health sampling repeatedly caught `active_reads_by_job={job-a:1, job-b:1}`
+    (one fair slot per job); every `source_read_counts` entry is 1;
+  * real read-source failure: `chmod 000` on `gw-03.log` →
+    `error_type: permission_denied` with start/end timestamps,
+    `active_reads` back to 0 immediately; after `chmod 644` the retry reads
+    exactly `gw-03.log` once and completes;
+  * brief sequence over HTTP: initial run `completed` →
+    `rescan_shards: [gw-01, gw-02]` reads each once → confirmed `job.json` and
+    part files persisted → externally truncated `gw-02`'s
+    `api.example.com` part → next run reports
+    `reread_shards: ["gw-02.log"]`, numbers `[2]`,
+    `repaired_shards: ["gw-02.log"]`, and merge totals equal the baseline;
+  * `BASE_URL=... bash scripts/demo.sh` passes end to end (baseline, truncate
+    repair, delete + unavailable → `partial`/withheld, restore → completed).
+* Live `uvicorn` run on the sample shards (`scripts/demo.sh`) baseline totals:
+  `api.example.com 48/3`, `cdn.shop.example.org 47/2`,
+  `ledger.example.io 29/1`, `media.example.dev 9/1`, `shop.example.org 47/3`,
+  `static.example.net 47/3`, `www.example.com 48/2` (total/5xx).
 * Crash tests: SIGKILL of a real child process mid-run (400k-line shard) followed
   by a successful retry; state rewound to "never scanned gw-c" followed by a
   retry that reads only `gw-c.log` and lands on the exact baseline totals.
+
+> The live contention run used deliberately large shards on a 2-CPU-cgroup
+> QEMU VM; per-read wall times are inflated by that environment's CPU
+> scheduling, but the scheduling invariants (cap, fairness order, slot
+> release, exactly-once) are asserted independently of timing.
 
 ## 7. Remaining items / limits
 
@@ -244,8 +331,15 @@ and resolved paths must stay inside it (symlink escapes are rejected).
   snapshot until a rescan is requested. Automatic detection would need mtime/size
   comparison per run; deliberately not implied, because readers may replay
   immutable archives.
-* **One job at a time per job id.** Concurrency is serialized by design (local
-  aggregation); there is no worker queue. Different jobs *can* run concurrently.
+* **One active run per job id.** Same-job runs are still serialized by the
+  in-process lock + cross-process `flock` (a concurrent same-job request gets
+  `409`). Different jobs run their reads concurrently and share the fair
+  scheduler; there is no separate durable worker queue.
+* **The read pool is per process.** `SOURCE_READ_CONCURRENCY` bounds one uvicorn
+  worker; the Dockerfile pins `--workers 1`. Multi-worker or multi-replica
+  deployments would get one pool per process (an N-worker server multiplies
+  the effective cap) and would need a shared/lock-backed scheduler for a
+  cluster-wide bound.
 * **Simulation endpoints are demo-only.** They are gated by
   `ALLOW_SIMULATION` (enabled in Compose); production use should disable them.
   `fault_injection` in `POST /run` is also test-only and should be refused at the
@@ -255,7 +349,11 @@ and resolved paths must stay inside it (symlink escapes are rejected).
   with an extreme number of distinct domains would need external sorting.
 * **No auth/TLS.** The service is intended for a trusted local network; put it
   behind a reverse proxy if exposed.
-* **Docker not executable in this sandbox.** The image and Compose file were
-  written and reviewed but `docker compose up` could not be executed here (no
-  Docker daemon/socket). The equivalent live run was done with `uvicorn` against
-  the same `LOG_DATA_DIR` / `WORK_DIR` environment variables.
+* **`docker compose up` was not executed from this sandbox.** There is no
+  Docker CLI/daemon here and the process runs with an empty effective capability
+  set (`CapEff=0`, no rootless helper), so an actual Compose boot could not be
+  performed in the delivery environment. `docker-compose.yml` was YAML-validated
+  and its environment/command were exercised equivalently by running uvicorn
+  locally with the same `LOG_DATA_DIR`, `WORK_DIR`, `ALLOW_SIMULATION` and
+  `SOURCE_READ_CONCURRENCY=2`; `/docs` and `/openapi.json` were checked over
+  HTTP (the Swagger page itself was not clicked in a browser).

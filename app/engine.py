@@ -50,6 +50,7 @@ from .models import (
     utcnow,
 )
 from .normalize import normalize_domain
+from .scheduler import ReadRequest, ReadScheduler, ReadTicket
 from .storage import (
     JobAlreadyExists,
     JobStore,
@@ -84,6 +85,31 @@ class Engine:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.store = JobStore(settings.data_dir, settings.work_dir)
+        # One process-local scheduler: initial scans, rescans and repair reads
+        # of every job share the same fixed read-slot cap and fairness policy.
+        self.read_scheduler = ReadScheduler(settings.source_read_concurrency)
+        self._state_locks_guard = threading.Lock()
+        self._state_locks: dict[str, threading.RLock] = {}
+
+    def shutdown(self) -> None:
+        """Stop scheduler worker threads (application lifespan shutdown)."""
+
+        self.read_scheduler.shutdown()
+
+    def _state_lock(self, job_id: str) -> threading.RLock:
+        """Serializes in-memory job/run mutation and job.json writes.
+
+        Several scheduler workers can finish shard reads of the same job at
+        the same time; the slow disk read itself runs without this lock, only
+        result application + atomic progress persistence take it.
+        """
+
+        with self._state_locks_guard:
+            lock = self._state_locks.get(job_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._state_locks[job_id] = lock
+            return lock
 
     # ------------------------------------------------------------------ jobs
     def create_job(self, request: JobCreateRequest) -> JobState:
@@ -251,6 +277,9 @@ class Engine:
         job.simulated_unavailable_sources.sort(key=job.shard_ids.index)
 
         # ---- Phase 1: scan shards that have no trusted snapshot yet ---------
+        # Initial scans and forced rescans are queued together and read in
+        # parallel through the process-wide fair scheduler. Every shard
+        # persists its own progress the moment its read finishes.
         rescan = set(request.rescan_shards)
         unknown_rescan = sorted(rescan - set(job.shard_ids))
         if unknown_rescan:
@@ -258,17 +287,32 @@ class Engine:
                 "rescan_shards contains shards that are not in this job: "
                 + ", ".join(unknown_rescan)
             )
+        scan_plan: list[tuple[str, str, bool]] = []
         for sid in job.shard_ids:
             state = job.shards[sid]
             if sid in rescan:
-                self._scan_shard(job, sid, run, kind="rescan", forced=True)
+                scan_plan.append((sid, "rescan", True))
                 continue
             if state.scan_status == ScanStatus.DONE and self._shard_manifest_trusted(job, sid):
                 continue
             resumed = state.read_attempts > 0 or job.last_run is not None
-            self._scan_shard(job, sid, run, kind="retry_scan" if resumed else "scan")
-        # Persist scan progress so a crash does not discard completed work.
-        self.store.save_job(job)
+            scan_plan.append((sid, "retry_scan" if resumed else "scan", False))
+
+        scan_requests = [
+            ReadRequest(
+                shard_id=sid,
+                kind=kind,
+                read=self._make_read(job, sid),
+                complete=self._make_scan_callback(job, run, sid, kind, forced),
+            )
+            for sid, kind, forced in scan_plan
+        ]
+        self.read_scheduler.run_batch(job.job_id, scan_requests)
+        # Phase barrier: all initial-scan/rescan reads are done and each
+        # shard's progress is already persisted; this final save makes the
+        # all-scans-complete point explicit before partition fault simulation.
+        with self._state_lock(job.job_id):
+            self.store.save_job(job)
 
         # ---- Phase 2: inject temporary-part damage ---------------------------
         for fault in request.fault_injection:
@@ -281,22 +325,38 @@ class Engine:
         damaged, unrepairable, errors = self._find_damaged_shards(job)
         # Every source this run has already tried to read: never read one twice.
         attempted = {read.shard_id for read in run.source_reads}
-        for sid in damaged:
-            if sid in attempted:
-                state = job.shards[sid]
-                state.scan_status = ScanStatus.FAILED
-                message = (
-                    f"shard {sid} could not be read earlier in this run; its damaged "
-                    "part files wait for the next retry"
-                )
-                state.last_error = state.last_error or message
-                state.last_error_type = state.last_error_type or "part_damaged"
-                if sid not in run.failed_repairs:
-                    run.failed_repairs.append(sid)
-                if message not in run.errors:
-                    run.errors.append(message)
-                continue
-            self._repair_shard(job, sid, run)
+        repair_plan: list[str] = []
+        with self._state_lock(job.job_id):
+            for sid in damaged:
+                if sid in attempted:
+                    state = job.shards[sid]
+                    state.scan_status = ScanStatus.FAILED
+                    message = (
+                        f"shard {sid} could not be read earlier in this run; its damaged "
+                        "part files wait for the next retry"
+                    )
+                    state.last_error = state.last_error or message
+                    state.last_error_type = state.last_error_type or "part_damaged"
+                    if sid not in run.failed_repairs:
+                        run.failed_repairs.append(sid)
+                    if message not in run.errors:
+                        run.errors.append(message)
+                    continue
+                repair_plan.append(sid)
+
+        # Repair/backfill reads go through the same shared scheduler slots as
+        # initial scans and rescans, for every job in this process.
+        repair_requests = [
+            ReadRequest(
+                shard_id=sid,
+                kind="repair",
+                read=self._make_read(job, sid),
+                complete=self._make_repair_callback(job, run, sid),
+            )
+            for sid in repair_plan
+        ]
+        self.read_scheduler.run_batch(job.job_id, repair_requests)
+
         _, post_unrepairable, post_errors = self._find_damaged_shards(job)
         for sid in job.shard_ids:
             if sid in post_unrepairable:
@@ -319,7 +379,25 @@ class Engine:
         # ---- Phase 5: merge verified parts per domain ------------------------
         self._merge(job, run)
         self._finalize_status(job)
-        self.store.save_job(job)
+        # Parallel completion order is nondeterministic; present report lists
+        # in the job's fixed shard order for stable API output and assertions.
+        self._sort_run_report(job, run)
+        with self._state_lock(job.job_id):
+            self.store.save_job(job)
+
+    def _sort_run_report(self, job: JobState, run: RunReport) -> None:
+        order = {sid: index for index, sid in enumerate(job.shard_ids)}
+
+        def key_of(sid: str) -> int:
+            return order.get(sid, len(order))
+
+        run.reread_shards.sort(key=key_of)
+        run.reread_shard_numbers = self._numbers(job, run.reread_shards)
+        run.repaired_shards.sort(key=key_of)
+        run.failed_repairs.sort(key=key_of)
+        run.source_reads.sort(
+            key=lambda read: (key_of(read.shard_id), read.started_at or "", read.kind)
+        )
 
     def _validate_faults(self, job: JobState, faults: list[FaultInjection]) -> None:
         for fault in faults:
@@ -333,32 +411,91 @@ class Engine:
         state = job.shards[shard_id]
         return state.successful_reads > 0 and state.source_sha256 is not None
 
-    def _scan_shard(
-        self, job: JobState, shard_id: str, run: RunReport, *, kind: str, forced: bool = False
-    ) -> bool:
+    def _make_read(self, job: JobState, shard_id: str):
+        """Build the lock-free disk read for one shard.
+
+        Expected whole-shard failures are returned as ``(None, error)`` rather
+        than raised so the scheduler/future path stays exception-free for
+        ordinary unreadable sources; unexpected exceptions still propagate.
+        """
+
+        def _read() -> tuple[ReadResult | None, ShardReadError | None]:
+            unavailable = shard_id in job.simulated_unavailable_sources
+            try:
+                result = read_shard(
+                    self.store.source_path(shard_id),
+                    shard_id,
+                    simulated_unavailable=unavailable,
+                )
+            except ShardReadError as exc:
+                return None, exc
+            return result, None
+
+        return _read
+
+    def _make_scan_callback(
+        self,
+        job: JobState,
+        run: RunReport,
+        shard_id: str,
+        kind: str,
+        forced: bool,
+    ):
+        def _complete(
+            ticket: ReadTicket,
+            outcome: tuple[ReadResult | None, ShardReadError | None] | None,
+            read_error: BaseException | None,
+        ) -> None:
+            if read_error is not None:
+                raise read_error
+            assert outcome is not None
+            result, shard_error = outcome
+            with self._state_lock(job.job_id):
+                self._apply_scan_outcome(
+                    job, run, shard_id, kind, forced, ticket, result, shard_error
+                )
+
+        return _complete
+
+    def _apply_scan_outcome(
+        self,
+        job: JobState,
+        run: RunReport,
+        shard_id: str,
+        kind: str,
+        forced: bool,
+        ticket: ReadTicket,
+        result: ReadResult | None,
+        error: ShardReadError | None,
+    ) -> None:
+        # Caller holds the job's state lock.
         state = job.shards[shard_id]
         state.read_attempts += 1
-        unavailable = shard_id in job.simulated_unavailable_sources
-        source_read = SourceRead(shard_id=shard_id, kind=kind, success=False)
-        try:
-            result = read_shard(
-                self.store.source_path(shard_id), shard_id, simulated_unavailable=unavailable
-            )
-        except ShardReadError as exc:
+        source_read = SourceRead(
+            shard_id=shard_id,
+            kind=kind,
+            success=error is None,
+            started_at=ticket.started_at,
+            finished_at=ticket.finished_at,
+            duration_ms=ticket.duration_ms,
+        )
+        if error is not None:
             state.scan_status = ScanStatus.FAILED
-            state.last_error_type = exc.error_type
-            state.last_error = str(exc)
-            source_read.error_type = exc.error_type
-            source_read.error = str(exc)
+            state.last_error_type = error.error_type
+            state.last_error = str(error)
+            source_read.error_type = error.error_type
+            source_read.error = str(error)
             run.source_reads.append(source_read)
-            run.errors.append(f"{shard_id}: {exc}")
+            run.errors.append(f"{shard_id}: {error}")
             if forced and state.successful_reads:
                 # The requested fresh snapshot was not obtained; the parts on
                 # disk are now known-stale and must not feed a published sum.
                 state.stale_parts = True
+            # Persist the failed attempt too and release happens in scheduler.
             self.store.save_job(job)
-            return False
+            return
 
+        assert result is not None
         self._write_shard_parts(job, shard_id, result)
         state.scan_status = ScanStatus.DONE
         state.successful_reads += 1
@@ -368,15 +505,12 @@ class Engine:
         state.stale_parts = False
         state.last_error_type = None
         state.last_error = None
-        source_read.success = True
         run.source_reads.append(source_read)
         run.source_read_counts[shard_id] = run.source_read_counts.get(shard_id, 0) + 1
         if kind in ("retry_scan", "rescan"):
             # The caller explicitly wants to know which sources were recomputed.
             if shard_id not in run.reread_shards:
                 run.reread_shards.append(shard_id)
-                run.reread_shards.sort(key=job.shard_ids.index)
-                run.reread_shard_numbers = self._numbers(job, run.reread_shards)
             if shard_id not in job.reread_shards:
                 job.reread_shards.append(shard_id)
                 job.reread_shards.sort(key=job.shard_ids.index)
@@ -384,8 +518,10 @@ class Engine:
             run.warnings.extend(
                 f"{shard_id}: malformed line {sample}" for sample in result.malformed_samples
             )
+        # Save this shard's progress immediately; other shards may still be
+        # reading in parallel but never mutate the same manifest without the
+        # state lock held by this callback.
         self.store.save_job(job)
-        return True
 
     def _write_shard_parts(self, job: JobState, shard_id: str, result: ReadResult) -> None:
         records: dict[str, PartRecord] = {}
@@ -500,32 +636,63 @@ class Engine:
         part_only = [s for s in job.shard_ids if s in unrepairable]
         return source_level, part_only, errors
 
-    def _repair_shard(self, job: JobState, shard_id: str, run: RunReport) -> None:
+    def _make_repair_callback(self, job: JobState, run: RunReport, shard_id: str):
+        def _complete(
+            ticket: ReadTicket,
+            outcome: tuple[ReadResult | None, ShardReadError | None] | None,
+            read_error: BaseException | None,
+        ) -> None:
+            if read_error is not None:
+                raise read_error
+            assert outcome is not None
+            result, shard_error = outcome
+            with self._state_lock(job.job_id):
+                self._apply_repair_outcome(
+                    job, run, shard_id, ticket, result, shard_error
+                )
+
+        return _complete
+
+    def _apply_repair_outcome(
+        self,
+        job: JobState,
+        run: RunReport,
+        shard_id: str,
+        ticket: ReadTicket,
+        result: ReadResult | None,
+        error: ShardReadError | None,
+    ) -> None:
+        # Caller holds the job's state lock.
         state = job.shards[shard_id]
         run.reread_shards.append(shard_id)
-        run.reread_shard_numbers = self._numbers(job, run.reread_shards)
         if shard_id not in job.reread_shards:
             job.reread_shards.append(shard_id)
             job.reread_shards.sort(key=job.shard_ids.index)
         state.read_attempts += 1
         state.repair_reads += 1
-        source_read = SourceRead(shard_id=shard_id, kind="repair", success=False)
-        try:
-            result = read_shard(
-                self.store.source_path(shard_id),
-                shard_id,
-                simulated_unavailable=shard_id in job.simulated_unavailable_sources,
-            )
-        except ShardReadError as exc:
+        source_read = SourceRead(
+            shard_id=shard_id,
+            kind="repair",
+            success=error is None,
+            started_at=ticket.started_at,
+            finished_at=ticket.finished_at,
+            duration_ms=ticket.duration_ms,
+        )
+        if error is not None:
             state.scan_status = ScanStatus.FAILED
-            state.last_error_type = exc.error_type
-            state.last_error = str(exc)
-            source_read.error_type = exc.error_type
-            source_read.error = str(exc)
+            state.last_error_type = error.error_type
+            state.last_error = str(error)
+            source_read.error_type = error.error_type
+            source_read.error = str(error)
             run.source_reads.append(source_read)
-            run.errors.append(f"repair of {shard_id} failed: {exc}")
-            run.failed_repairs.append(shard_id)
+            run.errors.append(f"repair of {shard_id} failed: {error}")
+            if shard_id not in run.failed_repairs:
+                run.failed_repairs.append(shard_id)
+            # Release happens in the scheduler; persist the failed attempt.
+            self.store.save_job(job)
             return
+
+        assert result is not None
         self._write_shard_parts(job, shard_id, result)
         state.scan_status = ScanStatus.DONE
         state.successful_reads += 1
@@ -535,7 +702,6 @@ class Engine:
         state.stale_parts = False
         state.last_error_type = None
         state.last_error = None
-        source_read.success = True
         run.source_reads.append(source_read)
         run.source_read_counts[shard_id] = run.source_read_counts.get(shard_id, 0) + 1
         if shard_id not in run.repaired_shards:

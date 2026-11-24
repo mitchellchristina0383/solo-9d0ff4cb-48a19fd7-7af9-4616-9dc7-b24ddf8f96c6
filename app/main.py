@@ -41,11 +41,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> Iterator[None]:
-        app.state.engine = Engine(configured)
+        engine = Engine(configured)
+        app.state.engine = engine
         logger.info(
-            "engine ready data_dir=%s work_dir=%s", configured.data_dir, configured.work_dir
+            "engine ready data_dir=%s work_dir=%s source_read_concurrency=%d",
+            configured.data_dir,
+            configured.work_dir,
+            configured.source_read_concurrency,
         )
-        yield
+        try:
+            yield
+        finally:
+            engine.shutdown()
 
     app = FastAPI(
         title="Gateway Log Aggregator",
@@ -96,6 +103,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "data_dir_exists": engine.settings.data_dir.is_dir(),
             "work_dir": str(engine.settings.work_dir),
             "work_dir_writable": _writable(engine.settings.work_dir),
+            "source_read_concurrency": engine.settings.source_read_concurrency,
+            "read_scheduler": engine.read_scheduler.snapshot(),
         }
 
     @app.get(

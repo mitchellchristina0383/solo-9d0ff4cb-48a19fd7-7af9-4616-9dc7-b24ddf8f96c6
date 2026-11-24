@@ -10,6 +10,12 @@ services:
       WORK_DIR: /work
       # Enables the demo-only /sources/unavailable and /sources/restore endpoints.
       ALLOW_SIMULATION: "true"
+      # Per single service process: maximum number of source shards read at
+      # once. Initial scans, rescans and repair/backfill reads share these
+      # slots. Free slots go first to jobs that have shards queued but no read
+      # in flight; leftover slots read multiple shards of one job in parallel.
+      # The image runs one uvicorn worker, so this is the process-wide cap.
+      SOURCE_READ_CONCURRENCY: "${SOURCE_READ_CONCURRENCY:-2}"
     volumes:
       # Source shards are read-only to the service.
       - ./samples/data:/data:ro

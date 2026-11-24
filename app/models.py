@@ -125,8 +125,17 @@ class FaultRecord(BaseModel):
 
 class SourceRead(BaseModel):
     shard_id: str
-    kind: str = Field(description="scan, retry_scan or repair")
+    kind: str = Field(description="scan, retry_scan, rescan or repair")
     success: bool
+    started_at: str | None = Field(
+        default=None, description="ISO-8601 time the actual source read started (after acquiring a slot)"
+    )
+    finished_at: str | None = Field(
+        default=None, description="ISO-8601 time the source read returned or failed"
+    )
+    duration_ms: float | None = Field(
+        default=None, description="Wall time of the actual source read in milliseconds"
+    )
     error_type: str | None = None
     error: str | None = None
 
